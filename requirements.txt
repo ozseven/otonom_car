@@ -1,0 +1,6 @@
+opencv-python
+numpy
+torch --index-url https://download.pytorch.org/whl/cu118
+torchvision --index-url https://download.pytorch.org/whl/cu118
+ultralytics  # YOLO için
+matplotlib 
