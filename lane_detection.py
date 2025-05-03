@@ -1,5 +1,6 @@
 import cv2
 import numpy as np
+from scipy.signal import find_peaks
 
 class LaneDetector:
     def __init__(self):
@@ -13,18 +14,28 @@ class LaneDetector:
         # Hough dönüşümü için parametreler
         self.rho = 1
         self.theta = np.pi/180
-        self.threshold = 50
-        self.min_line_length = 100
+        self.threshold = 30
+        self.min_line_length = 40
         self.max_line_gap = 50
         
         # Şerit filtreleme parametreleri
-        self.min_slope = 0.3  # Minimum eğim
-        self.max_slope = 2.0  # Maximum eğim
-        self.roi_vertices = None  # İlgi alanı köşe noktaları
+        self.min_slope = 0.2
+        self.max_slope = 2.0
+        self.roi_vertices = None
         
-        # Şerit tipleri için parametreler
-        self.dashed_line_gap = 50  # Kesikli çizgi boşluğu
-        self.solid_line_length = 100  # Düz çizgi minimum uzunluğu
+        # Şerit takibi için parametreler
+        self.prev_lines = []
+        self.max_prev_lines = 10
+        self.line_persistence = 5
+        self.line_counter = {}
+        
+        # Polinom regresyon parametreleri
+        self.poly_degree = 2  # Polinom derecesi
+        self.left_fit = None  # Sol şerit polinom katsayıları
+        self.right_fit = None  # Sağ şerit polinom katsayıları
+        self.left_points = []  # Sol şerit noktaları
+        self.right_points = []  # Sağ şerit noktaları
+        self.smooth_factor = 0.8  # Polinom yumuşatma faktörü
 
     def set_roi(self, image_shape):
         """
@@ -37,55 +48,123 @@ class LaneDetector:
              (width/2 + width/4, height/2), (width, height)]
         ], dtype=np.int32)
 
-    def classify_lane_type(self, line):
+    def calculate_slope(self, x1, y1, x2, y2):
         """
-        Şerit tipini belirler (kesikli/düz)
+        İki nokta arasındaki eğimi hesaplar
         """
-        x1, y1, x2, y2 = line[0]
-        length = np.sqrt((x2 - x1)**2 + (y2 - y1)**2)
+        if x2 - x1 == 0:
+            return float('inf')
+        return (y2 - y1) / (x2 - x1)
+
+    def separate_lanes(self, lines):
+        """
+        Tespit edilen çizgileri sol ve sağ şerit olarak ayırır
+        """
+        left_lines = []
+        right_lines = []
         
-        if length < self.solid_line_length:
-            return "Kesikli Şerit"
-        else:
-            return "Düz Şerit"
+        if lines is None:
+            return left_lines, right_lines
+            
+        for line in lines:
+            x1, y1, x2, y2 = line[0]
+            slope = self.calculate_slope(x1, y1, x2, y2)
+            
+            # Çizginin orta noktasını hesapla
+            mid_x = (x1 + x2) / 2
+            
+            # Çizgiyi sol veya sağ şeride ata
+            if slope < 0 and mid_x < 320:  # Sol şerit
+                left_lines.append(line)
+            elif slope > 0 and mid_x > 320:  # Sağ şerit
+                right_lines.append(line)
+                
+        return left_lines, right_lines
+
+    def fit_polynomial(self, lines, side='left'):
+        """
+        Şerit noktalarına polinom uydurur
+        """
+        if not lines:
+            return None
+            
+        # Tüm noktaları topla
+        points = []
+        for line in lines:
+            x1, y1, x2, y2 = line[0]
+            points.extend([(x1, y1), (x2, y2)])
+            
+        points = np.array(points)
+        if len(points) < 2:
+            return None
+            
+        # x ve y koordinatlarını ayır
+        x = points[:, 0]
+        y = points[:, 1]
+        
+        # Polinom uydur
+        try:
+            fit = np.polyfit(y, x, self.poly_degree)
+            
+            # Önceki polinom ile yumuşat
+            if side == 'left' and self.left_fit is not None:
+                fit = self.smooth_factor * self.left_fit + (1 - self.smooth_factor) * fit
+            elif side == 'right' and self.right_fit is not None:
+                fit = self.smooth_factor * self.right_fit + (1 - self.smooth_factor) * fit
+                
+            return fit
+        except:
+            return None
+
+    def generate_lane_points(self, fit, y_start, y_end):
+        """
+        Polinom katsayılarından şerit noktalarını oluşturur
+        """
+        if fit is None:
+            return []
+            
+        # y değerlerini oluştur
+        y = np.linspace(y_start, y_end, 50)
+        
+        # x değerlerini hesapla
+        x = np.polyval(fit, y)
+        
+        # Noktaları birleştir
+        points = np.column_stack((x, y))
+        return points.astype(np.int32)
 
     def filter_lines(self, lines):
         """
-        Tespit edilen çizgileri filtreler ve şerit tiplerini belirler
+        Tespit edilen çizgileri filtreler
         """
         if lines is None:
-            return []
+            return self.prev_lines
             
         filtered_lines = []
         for line in lines:
             x1, y1, x2, y2 = line[0]
+            slope = self.calculate_slope(x1, y1, x2, y2)
             
-            # Yatay çizgileri filtrele
-            if abs(x2 - x1) < 20:  # Dikey çizgileri kabul et
-                continue
-                
-            # Eğimi hesapla
-            if x2 - x1 == 0:
-                continue
-            slope = abs((y2 - y1) / (x2 - x1))
-            
-            # Eğim aralığında olan çizgileri kabul et
-            if self.min_slope <= slope <= self.max_slope:
-                # Şerit tipini belirle
-                lane_type = self.classify_lane_type(line)
-                filtered_lines.append((line, lane_type))
-                
+            if abs(slope) >= self.min_slope and abs(slope) <= self.max_slope:
+                filtered_lines.append(line)
+        
+        # Sol ve sağ şeritleri ayır
+        left_lines, right_lines = self.separate_lanes(filtered_lines)
+        
+        # Polinom uydur
+        self.left_fit = self.fit_polynomial(left_lines, 'left')
+        self.right_fit = self.fit_polynomial(right_lines, 'right')
+        
+        # Şerit noktalarını oluştur
+        height = 480  # Görüntü yüksekliği
+        self.left_points = self.generate_lane_points(self.left_fit, height, height//2)
+        self.right_points = self.generate_lane_points(self.right_fit, height, height//2)
+        
         return filtered_lines
 
     def preprocess_image(self, image):
         """
         Görüntüyü ön işleme adımlarından geçirir
-        
-        Args:
-            image: İşlenecek görüntü
-            
-        Returns:
-            İşlenmiş görüntü
         """
         # Görüntüyü küçült
         image = cv2.resize(image, (640, 480))
@@ -112,25 +191,27 @@ class LaneDetector:
     def detect_edges(self, image):
         """
         Canny kenar tespiti uygular
-        
-        Args:
-            image: İşlenecek görüntü
-            
-        Returns:
-            Kenar tespiti yapılmış görüntü
         """
         edges = cv2.Canny(image, self.low_threshold, self.high_threshold)
         return edges
 
+    def draw_lane_lines(self, image):
+        """
+        Şeritleri görüntüye çizer
+        """
+        # Sol şeridi çiz
+        if len(self.left_points) > 1:
+            cv2.polylines(image, [self.left_points], False, (255, 255, 255), 3)
+            
+        # Sağ şeridi çiz
+        if len(self.right_points) > 1:
+            cv2.polylines(image, [self.right_points], False, (255, 255, 255), 3)
+            
+        return image
+
     def detect_lanes(self, image):
         """
         Şeritleri tespit eder
-        
-        Args:
-            image: İşlenecek görüntü
-            
-        Returns:
-            Şeritlerin çizildiği görüntü
         """
         # Görüntüyü ön işle
         processed = self.preprocess_image(image)
@@ -148,22 +229,10 @@ class LaneDetector:
             maxLineGap=self.max_line_gap
         )
         
-        # Çizgileri filtrele ve şerit tiplerini belirle
-        filtered_lines = self.filter_lines(lines)
+        # Çizgileri filtrele
+        self.filter_lines(lines)
         
-        # Tespit edilen şeritleri görüntüye çiz
-        if filtered_lines:
-            for line, lane_type in filtered_lines:
-                x1, y1, x2, y2 = line[0]
-                
-                # Şerit tipine göre renk belirle
-                color = (0, 255, 0) if lane_type == "Düz Şerit" else (0, 0, 255)
-                
-                # Şeridi çiz
-                cv2.line(image, (x1, y1), (x2, y2), color, 2)
-                
-                # Şerit tipini yaz
-                cv2.putText(image, lane_type, (x1, y1 - 10),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+        # Şeritleri çiz
+        image = self.draw_lane_lines(image)
         
         return image 
