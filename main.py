@@ -10,6 +10,10 @@ import threading
 from queue import Queue
 import concurrent.futures
 
+# FPS sınırı
+MAX_FPS = 60
+FRAME_TIME = 1.0 / MAX_FPS
+
 def resize_image(image, target_width=640, target_height=480):
     """
     Görüntüyü hedef boyuta yeniden boyutlandırır
@@ -105,30 +109,39 @@ class VideoProcessor:
         frame_count = 0
         
         while self.running:
-            ret, frame = cap.read()
-            if not ret:
-                print("Video bitti veya okunamadı!")
-                break
-                
-            frame_count += 1
-            if frame_count == 1:
-                print(f"Video boyutu: {frame.shape}")
-                
-            current_time = time.time()
-            current_fps = 1 / (current_time - prev_time) if prev_time > 0 else 0
-            prev_time = current_time
-            
-            frame = resize_image(frame)
-            self.frame_queue.put((frame, current_fps))
-            
-            # Kuyruk doluysa eski kareleri at
-            if self.frame_queue.full():
-                try:
-                    self.frame_queue.get_nowait()
-                except:
-                    pass
+            try:
+                ret, frame = cap.read()
+                if not ret:
+                    print("Video bitti veya okunamadı!")
+                    break
                     
-            await asyncio.sleep(0.001)  # CPU kullanımını azalt
+                frame_count += 1
+                if frame_count == 1:
+                    print(f"Video boyutu: {frame.shape}")
+                    
+                current_time = time.time()
+                elapsed = current_time - prev_time
+                
+                # FPS sınırlaması
+                if elapsed < FRAME_TIME:
+                    await asyncio.sleep(FRAME_TIME - elapsed)
+                
+                current_fps = 1 / (time.time() - prev_time) if prev_time > 0 else 0
+                prev_time = time.time()
+                
+                frame = resize_image(frame)
+                self.frame_queue.put((frame, current_fps))
+                
+                # Kuyruk doluysa eski kareleri at
+                if self.frame_queue.full():
+                    try:
+                        self.frame_queue.get_nowait()
+                    except:
+                        pass
+                        
+            except Exception as e:
+                print(f"Video işleme hatası: {str(e)}")
+                continue
 
     async def process_frames(self):
         """
@@ -181,42 +194,46 @@ async def main():
     processor = VideoProcessor()
     processor.running = True
     
-    # Video işleme ve kare işleme görevlerini başlat
-    video_task = asyncio.create_task(processor.process_video(cap))
-    frame_task = asyncio.create_task(processor.process_frames())
-    
-    prev_objects = {}
-    print("Video işleme başlıyor...")
-    
     try:
+        # Video işleme ve kare işleme görevlerini başlat
+        video_task = asyncio.create_task(processor.process_video(cap))
+        frame_task = asyncio.create_task(processor.process_frames())
+        
+        prev_objects = {}
+        print("Video işleme başlıyor...")
+        
         while True:
-            if not processor.result_queue.empty():
-                (frame_with_lanes, frame_with_objects, current_objects), fps = processor.result_queue.get()
-                
-                if current_objects != prev_objects:
-                    prev_objects = current_objects.copy()
-                
-                draw_info_panel(frame_with_objects, fps, current_objects)
-                
-                try:
-                    combined_frame = cv2.hconcat([frame_with_lanes, frame_with_objects])
-                    cv2.imshow('Otonom Araç Görüntü İşleme', combined_frame)
-                except cv2.error as e:
-                    print(f"Görüntü birleştirme hatası: {str(e)}")
-                    continue
-                
-                if cv2.waitKey(1) & 0xFF == ord('q'):
-                    print("Kullanıcı tarafından durduruldu")
-                    break
+            try:
+                if not processor.result_queue.empty():
+                    (frame_with_lanes, frame_with_objects, current_objects), fps = processor.result_queue.get()
                     
-            await asyncio.sleep(0.001)
-            
+                    if current_objects != prev_objects:
+                        prev_objects = current_objects.copy()
+                    
+                    draw_info_panel(frame_with_objects, fps, current_objects)
+                    
+                    try:
+                        # Görüntüleri yan yana birleştir
+                        combined_frame = cv2.hconcat([frame_with_lanes, frame_with_objects])
+                        cv2.imshow('Otonom Araç Görüntü İşleme', combined_frame)
+                    except cv2.error as e:
+                        print(f"Görüntü birleştirme hatası: {str(e)}")
+                        # Hata durumunda sadece nesne tespiti görüntüsünü göster
+                        cv2.imshow('Otonom Araç Görüntü İşleme', frame_with_objects)
+                    
+                    if cv2.waitKey(1) & 0xFF == ord('q'):
+                        break
+                        
+                await asyncio.sleep(0.001)
+                
+            except Exception as e:
+                print(f"Ana döngü hatası: {str(e)}")
+                continue
+                
     except Exception as e:
-        print(f"Hata oluştu: {str(e)}")
+        print(f"Program hatası: {str(e)}")
     finally:
-        print("Program sonlandırılıyor...")
         processor.running = False
-        await asyncio.gather(video_task, frame_task, return_exceptions=True)
         cap.release()
         cv2.destroyAllWindows()
         print("Program sonlandırıldı.")
