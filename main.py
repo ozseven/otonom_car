@@ -1,6 +1,7 @@
 import cv2
 from lane_detection import LaneDetector
 from object_detection import ObjectDetector
+from traffic_sign_detector import TrafficSignDetector
 import time
 import numpy as np
 import tkinter as tk
@@ -14,15 +15,11 @@ import concurrent.futures
 MAX_FPS = 60
 FRAME_TIME = 1.0 / MAX_FPS
 
-def resize_image(image, target_width=480, target_height=480):
+def resize_image(image, target_width=640, target_height=480):
     """
     Görüntüyü hedef boyuta yeniden boyutlandırır
     """
-    # Görüntüyü döndür (90 derece saat yönünde)
-    #rotated = cv2.rotate(image, cv2.ROTATE_90_CLOCKWISE)
-    #rotated = cv2.rotate(image,cv2.rotate)
-    # Boyutlandır
-    #resized = cv2.resize(rotated, (target_width, target_height))
+    
     resized = cv2.resize(image, (target_width, target_height))
     return resized
 
@@ -69,6 +66,8 @@ class VideoProcessor:
         self.running = False
         self.lane_detector = LaneDetector()
         self.object_detector = ObjectDetector()
+        self.traffic_sign_detector = TrafficSignDetector()
+        self.rotate_flag = 0  # 0: no rotation, 1: 90 deg, 2: 180 deg, 3: 270 deg
         print("Video işleyici başlatıldı")
         
     async def process_frame(self, frame):
@@ -78,7 +77,7 @@ class VideoProcessor:
         try:
             loop = asyncio.get_event_loop()
             
-            # Şerit ve nesne tespitini paralel olarak yap
+            # Şerit, nesne ve trafik işareti tespitini paralel olarak yap
             with concurrent.futures.ThreadPoolExecutor() as executor:
                 print("Şerit tespiti başlatılıyor...")
                 lane_future = loop.run_in_executor(
@@ -87,6 +86,10 @@ class VideoProcessor:
                 print("Nesne tespiti başlatılıyor...")
                 object_future = loop.run_in_executor(
                     executor, self.object_detector.detect_objects, frame.copy())
+                
+                print("Trafik işareti tespiti başlatılıyor...")
+                traffic_sign_future = loop.run_in_executor(
+                    executor, self.traffic_sign_detector.detect_signs, frame.copy())
                 
                 # Sonuçları al
                 print("Şerit tespiti sonuçları bekleniyor...")
@@ -97,13 +100,17 @@ class VideoProcessor:
                 frame_with_objects, current_objects = await object_future
                 print("Nesne tespiti tamamlandı")
                 
-            return frame_with_lanes, frame_with_objects, current_objects
+                print("Trafik işareti tespiti sonuçları bekleniyor...")
+                frame_with_traffic_signs = await traffic_sign_future
+                print("Trafik işareti tespiti tamamlandı")
+                
+            return frame_with_lanes, frame_with_objects, current_objects, frame_with_traffic_signs
         except Exception as e:
             print(f"Kare işleme hatası: {str(e)}")
             print(f"Hata detayı: {type(e).__name__}")
             import traceback
             print(f"Hata izi: {traceback.format_exc()}")
-            return None, None, {}
+            return None, None, {}, None
 
     async def process_video(self, cap):
         """
@@ -134,6 +141,14 @@ class VideoProcessor:
                 
                 current_fps = 1 / (time.time() - prev_time) if prev_time > 0 else 0
                 prev_time = time.time()
+
+                # Rotate frame based on the processor's flag BEFORE resizing
+                if self.rotate_flag == 1:
+                    frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+                elif self.rotate_flag == 2:
+                    frame = cv2.rotate(frame, cv2.ROTATE_180)
+                elif self.rotate_flag == 3:
+                    frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
                 
                 frame = resize_image(frame)
                 self.frame_queue.put((frame, current_fps))
@@ -175,9 +190,19 @@ async def main():
     Ana uygulama fonksiyonu
     """
     print("Program başlatılıyor...")
-    video_path = select_video_file()
+
+    video_path = None
+    print(video_path)
+    for i in range(10):
+        print(i)
+        video_path = select_video_file()
+        if video_path:
+            break
+        print(f"Dosya seçilmedi, {i+1}. deneme. 0.5 saniye sonra tekrar deneniyor...")
+        await asyncio.sleep(0.5)
+
     if not video_path:
-        print("Video dosyası seçilmedi!")
+        print("10 denemeden sonra hala dosya seçilmedi. Program sonlandırılıyor.")
         return
     
     print(f"Seçilen video: {video_path}")
@@ -200,6 +225,8 @@ async def main():
     processor = VideoProcessor()
     processor.running = True
     
+    # rotate_flag is now managed within the processor instance
+    
     try:
         # Video işleme ve kare işleme görevlerini başlat
         video_task = asyncio.create_task(processor.process_video(cap))
@@ -211,7 +238,7 @@ async def main():
         while True:
             try:
                 if not processor.result_queue.empty():
-                    (frame_with_lanes, frame_with_objects, current_objects), fps = processor.result_queue.get()
+                    (frame_with_lanes, frame_with_objects, current_objects, frame_with_traffic_signs), fps = processor.result_queue.get()
                     
                     if current_objects != prev_objects:
                         prev_objects = current_objects.copy()
@@ -219,17 +246,24 @@ async def main():
                     draw_info_panel(frame_with_objects, fps, current_objects)
                     
                     try:
-                        # Görüntüleri yan yana birleştir
-                        combined_frame = cv2.hconcat([frame_with_lanes, frame_with_objects])
+                        # Şerit, nesne ve trafik işaretlerini birleştir
+                        # Rotation is now handled before processing in process_video
+                        combined_frame = cv2.hconcat([frame_with_lanes, frame_with_traffic_signs])
                         cv2.imshow('Otonom Araç Görüntü İşleme', combined_frame)
                     except cv2.error as e:
                         print(f"Görüntü birleştirme hatası: {str(e)}")
-                        # Hata durumunda sadece nesne tespiti görüntüsünü göster
-                        cv2.imshow('Otonom Araç Görüntü İşleme', frame_with_objects)
-                    
-                    if cv2.waitKey(1) & 0xFF == ord('q'):
+                        # If combining fails, show one of the processed frames (e.g., traffic signs)
+                        # Ensure this frame is displayed even if hconcat fails
+                        cv2.imshow('Otonom Araç Görüntü İşleme', frame_with_traffic_signs)
+
+                    key = cv2.waitKey(1) & 0xFF
+                    if key == ord('q'):
                         break
-                        
+                    elif key == ord('r'):
+                        # Update the processor's rotate flag
+                        processor.rotate_flag = (processor.rotate_flag + 1) % 4
+                        print(f"Görüntü döndürme: {processor.rotate_flag * 90} derece")
+
                 await asyncio.sleep(0.001)
                 
             except Exception as e:
