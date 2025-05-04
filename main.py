@@ -14,14 +14,16 @@ import concurrent.futures
 MAX_FPS = 60
 FRAME_TIME = 1.0 / MAX_FPS
 
-def resize_image(image, target_width=640, target_height=480):
+def resize_image(image, target_width=480, target_height=480):
     """
     Görüntüyü hedef boyuta yeniden boyutlandırır
     """
-    # Görüntüyü döndür (90 derece saat yönünün tersine)
-    rotated = cv2.rotate(image, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    # Görüntüyü döndür (90 derece saat yönünde)
+    #rotated = cv2.rotate(image, cv2.ROTATE_90_CLOCKWISE)
+    #rotated = cv2.rotate(image,cv2.rotate)
     # Boyutlandır
-    resized = cv2.resize(rotated, (target_width, target_height))
+    #resized = cv2.resize(rotated, (target_width, target_height))
+    resized = cv2.resize(image, (target_width, target_height))
     return resized
 
 def draw_info_panel(image, fps, detected_objects):
