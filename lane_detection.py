@@ -1,377 +1,128 @@
 import cv2
 import numpy as np
-from scipy.signal import find_peaks
 
 class LaneDetector:
     def __init__(self):
-        """
-        Şerit tespiti için gerekli parametreleri başlatır
-        """
-        # Canny kenar tespiti için parametreler
-        self.low_threshold = 50
-        self.high_threshold = 150
-        
-        # Hough dönüşümü için parametreler
-        self.rho = 1
-        self.theta = np.pi/180
-        self.threshold = 25
-        self.min_line_length = 25
-        self.max_line_gap = 80
-        
-        # Şerit filtreleme parametreleri
-        self.min_slope = 0.05
-        self.max_slope = 3.0
-        self.roi_vertices = None
-        
-        # Perspektif düzeltme parametreleri
-        self.perspective_matrix = None
-        self.inverse_perspective_matrix = None
-        self.lane_width_ratio = 0.1  # Görüntü genişliğine göre şerit genişliği oranı
-        self.expected_lane_width = 3.5  # Metre cinsinden beklenen şerit genişliği
-        
-        # Şerit takibi için parametreler
-        self.prev_lines = []
-        self.max_prev_lines = 10
-        self.line_persistence = 5
-        self.line_counter = {}
-        
-        # Polinom regresyon parametreleri
-        self.poly_degree = 2
+        # Önceki fitler (stabilizasyon için)
         self.left_fit = None
         self.right_fit = None
-        self.left_points = []
-        self.right_points = []
-        self.smooth_factor = 0.85
-        
-        # Perspektif düzeltme noktaları
-        self.src_points = None
-        self.dst_points = None
-        
-        # Görüntü boyutları
-        self.image_width = None
-        self.image_height = None
-        self.scale_factor = 1.0
 
-    def calculate_scale_factor(self, width, height):
-        """
-        Görüntü boyutlarına göre ölçeklendirme faktörünü hesaplar
-        """
-        # Referans boyutlar (1280x720)
-        ref_width = 1920
-        ref_height = 1080
-        
-        # Genişlik ve yükseklik için ayrı ölçeklendirme faktörleri
-        width_scale = width / ref_width
-        height_scale = height / ref_height
-        
-        # En küçük ölçeklendirme faktörünü kullan
-        return min(width_scale, height_scale)
-
-    def scale_parameters(self):
-        """
-        Görüntü boyutlarına göre parametreleri ölçeklendirir
-        """
-        if self.image_width is None or self.image_height is None:
-            return
-            
-        # Ölçeklendirme faktörünü hesapla
-        self.scale_factor = self.calculate_scale_factor(self.image_width, self.image_height)
-        
-        # Hough dönüşümü parametrelerini ölçeklendir
-        self.min_line_length = int(25 * self.scale_factor)
-        self.max_line_gap = int(80 * self.scale_factor)
-        
-        # Şerit genişliğini ölçeklendir
-        self.lane_width_pixels = int(self.image_width * self.lane_width_ratio)
-
-    def initialize_perspective_transform(self, image_shape):
-        """
-        Perspektif dönüşüm matrisini başlatır
-        """
-        height, width = image_shape[:2]
-        self.image_width = width
-        self.image_height = height
-        
-        # Parametreleri ölçeklendir
-        self.scale_parameters()
-        
-        # Kaynak noktalar (orijinal görüntüdeki trapez)
-        # Çok daha dar ve merkezi bir görüş açısı için noktaları ayarla
-        self.src_points = np.float32([
-            [width * 0.35, height],  # Sol alt - daha sağa
-            [width * 0.48, height * 0.5],  # Sol üst - daha yukarı ve sağa
-            [width * 0.52, height * 0.5],  # Sağ üst - daha yukarı ve sola
-            [width * 0.65, height]  # Sağ alt - daha sola
+    def get_birds_eye_view(self, frame):
+        height, width = frame.shape[:2]
+        src = np.float32([
+            [width * 0.45, height * 0.63],
+            [width * 0.55, height * 0.63],
+            [width * 0.90, height],
+            [width * 0.10, height]
         ])
-        
-        # Hedef noktalar (düzleştirilmiş görüntüdeki dikdörtgen)
-        # Çok daha dar ve merkezi bir çıktı için noktaları ayarla
-        self.dst_points = np.float32([
-            [width * 0.35, height],  # Sol alt
-            [width * 0.35, 0],  # Sol üst
-            [width * 0.65, 0],  # Sağ üst
-            [width * 0.65, height]  # Sağ alt
+        dst = np.float32([
+            [width * 0.2, 0],
+            [width * 0.8, 0],
+            [width * 0.8, height],
+            [width * 0.2, height]
         ])
-        
-        # Perspektif dönüşüm matrislerini hesapla
-        self.perspective_matrix = cv2.getPerspectiveTransform(self.src_points, self.dst_points)
-        self.inverse_perspective_matrix = cv2.getPerspectiveTransform(self.dst_points, self.src_points)
+        M = cv2.getPerspectiveTransform(src, dst)
+        warped = cv2.warpPerspective(frame, M, (width, height))
+        return warped, M
 
-    def apply_perspective_transform(self, image):
-        """
-        Perspektif düzeltme uygular
-        """
-        if self.perspective_matrix is None:
-            self.initialize_perspective_transform(image.shape)
-        
-        return cv2.warpPerspective(image, self.perspective_matrix, (image.shape[1], image.shape[0]))
+    def inverse_perspective(self, image, M):
+        height, width = image.shape[:2]
+        Minv = np.linalg.inv(M)
+        return cv2.warpPerspective(image, Minv, (width, height))
 
-    def inverse_perspective_transform(self, image):
-        """
-        Ters perspektif düzeltme uygular
-        """
-        if self.inverse_perspective_matrix is None:
-            self.initialize_perspective_transform(image.shape)
-        
-        return cv2.warpPerspective(image, self.inverse_perspective_matrix, (image.shape[1], image.shape[0]))
+    def apply_thresholds(self, img):
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        blur = cv2.GaussianBlur(gray, (5, 5), 0)
+        sobelx = cv2.Sobel(blur, cv2.CV_64F, 1, 0, ksize=3)
+        abs_sobelx = np.absolute(sobelx)
+        scaled_sobel = np.uint8(255 * abs_sobelx / np.max(abs_sobelx))
+        _, binary = cv2.threshold(scaled_sobel, 50, 255, cv2.THRESH_BINARY)
+        return binary
 
-    def calculate_lane_width(self, left_fit, right_fit, y):
-        """
-        Belirli bir y koordinatında şerit genişliğini hesaplar
-        """
-        if left_fit is None or right_fit is None:
-            return None
-            
-        left_x = np.polyval(left_fit, y)
-        right_x = np.polyval(right_fit, y)
-        return right_x - left_x
+    def find_lane_pixels(self, binary_warped):
+        histogram = np.sum(binary_warped[binary_warped.shape[0]//2:, :], axis=0)
+        midpoint = np.int32(histogram.shape[0]//2)
+        leftx_base = np.argmax(histogram[:midpoint])
+        rightx_base = np.argmax(histogram[midpoint:]) + midpoint
 
-    def adjust_lane_width(self, left_fit, right_fit, y_points):
-        """
-        Şerit genişliğini ayarlar
-        """
-        if left_fit is None or right_fit is None:
-            return left_fit, right_fit
-            
-        # Ortalama şerit genişliğini hesapla
-        widths = []
-        for y in y_points:
-            width = self.calculate_lane_width(left_fit, right_fit, y)
-            if width is not None:
-                widths.append(width)
-        
-        if not widths:
-            return left_fit, right_fit
-            
-        avg_width = np.mean(widths)
-        
-        # Şerit genişliğini ayarla
-        tolerance = int(self.lane_width_pixels * 0.1)  # %10 tolerans
-        if abs(avg_width - self.lane_width_pixels) > tolerance:
-            # Sağ şeridi sola veya sağa kaydır
-            adjustment = (self.lane_width_pixels - avg_width) / 2
-            right_fit[0] = right_fit[0] - adjustment
-            
+        nwindows = 9
+        margin = 100
+        minpix = 50
+
+        window_height = np.int32(binary_warped.shape[0] // nwindows)
+        nonzero = binary_warped.nonzero()
+        nonzeroy = np.array(nonzero[0])
+        nonzerox = np.array(nonzero[1])
+
+        leftx_current = leftx_base
+        rightx_current = rightx_base
+
+        left_lane_inds = []
+        right_lane_inds = []
+
+        for window in range(nwindows):
+            win_y_low = binary_warped.shape[0] - (window + 1) * window_height
+            win_y_high = binary_warped.shape[0] - window * window_height
+            win_xleft_low = leftx_current - margin
+            win_xleft_high = leftx_current + margin
+            win_xright_low = rightx_current - margin
+            win_xright_high = rightx_current + margin
+
+            good_left_inds = ((nonzeroy >= win_y_low) & (nonzeroy < win_y_high) &
+                              (nonzerox >= win_xleft_low) & (nonzerox < win_xleft_high)).nonzero()[0]
+            good_right_inds = ((nonzeroy >= win_y_low) & (nonzeroy < win_y_high) &
+                               (nonzerox >= win_xright_low) & (nonzerox < win_xright_high)).nonzero()[0]
+
+            left_lane_inds.append(good_left_inds)
+            right_lane_inds.append(good_right_inds)
+
+            if len(good_left_inds) > minpix:
+                leftx_current = np.int32(np.mean(nonzerox[good_left_inds]))
+            if len(good_right_inds) > minpix:
+                rightx_current = np.int32(np.mean(nonzerox[good_right_inds]))
+
+        left_lane_inds = np.concatenate(left_lane_inds)
+        right_lane_inds = np.concatenate(right_lane_inds)
+
+        leftx = nonzerox[left_lane_inds]
+        lefty = nonzeroy[left_lane_inds]
+        rightx = nonzerox[right_lane_inds]
+        righty = nonzeroy[right_lane_inds]
+
+        return leftx, lefty, rightx, righty
+
+    def fit_polynomial(self, binary_warped, leftx, lefty, rightx, righty):
+        try:
+            left_fit = np.polyfit(lefty, leftx, 2)
+            right_fit = np.polyfit(righty, rightx, 2)
+            self.left_fit = left_fit
+            self.right_fit = right_fit
+        except:
+            left_fit = self.left_fit
+            right_fit = self.right_fit
         return left_fit, right_fit
 
-    def set_roi(self, image_shape):
-        """
-        İlgi alanını (ROI) belirler
-        """
-        height, width = image_shape[:2]
-        # Alt yarısı ve orta kısmı seç
-        self.roi_vertices = np.array([
-            [(0, height), (width/2 - width/4, height/2),
-             (width/2 + width/4, height/2), (width, height)]
-        ], dtype=np.int32)
+    def draw_lanes(self, original_img, binary_warped, left_fit, right_fit, M):
+        ploty = np.linspace(0, binary_warped.shape[0] - 1, binary_warped.shape[0])
+        left_fitx = left_fit[0] * ploty ** 2 + left_fit[1] * ploty + left_fit[2]
+        right_fitx = right_fit[0] * ploty ** 2 + right_fit[1] * ploty + right_fit[2]
 
-    def calculate_slope(self, x1, y1, x2, y2):
-        """
-        İki nokta arasındaki eğimi hesaplar
-        """
-        if x2 - x1 == 0:
-            return float('inf')
-        return (y2 - y1) / (x2 - x1)
+        warp_zero = np.zeros_like(binary_warped).astype(np.uint8)
+        color_warp = np.dstack((warp_zero, warp_zero, warp_zero))
 
-    def separate_lanes(self, lines):
-        """
-        Tespit edilen çizgileri sol ve sağ şerit olarak ayırır
-        """
-        left_lines = []
-        right_lines = []
-        
-        if lines is None:
-            return left_lines, right_lines
-            
-        for line in lines:
-            x1, y1, x2, y2 = line[0]
-            slope = self.calculate_slope(x1, y1, x2, y2)
-            
-            # Çizginin orta noktasını hesapla
-            mid_x = (x1 + x2) / 2
-            
-            # Çizgiyi sol veya sağ şeride ata
-            if slope < 0 and mid_x < 640:  # Sol şerit
-                left_lines.append(line)
-            elif slope > 0 and mid_x > 640:  # Sağ şerit
-                right_lines.append(line)
-                
-        return left_lines, right_lines
+        pts_left = np.array([np.transpose(np.vstack([left_fitx, ploty]))])
+        pts_right = np.array([np.flipud(np.transpose(np.vstack([right_fitx, ploty])))])
+        pts = np.hstack((pts_left, pts_right))
 
-    def fit_polynomial(self, lines, side='left'):
-        """
-        Şerit noktalarına polinom uydurur
-        """
-        if not lines:
-            return None
-            
-        points = []
-        for line in lines:
-            x1, y1, x2, y2 = line[0]
-            points.extend([(x1, y1), (x2, y2)])
-            
-        points = np.array(points)
-        if len(points) < 2:
-            return None
-            
-        x = points[:, 0]
-        y = points[:, 1]
-        
-        try:
-            fit = np.polyfit(y, x, self.poly_degree)
-            
-            if side == 'left' and self.left_fit is not None:
-                fit = self.smooth_factor * self.left_fit + (1 - self.smooth_factor) * fit
-            elif side == 'right' and self.right_fit is not None:
-                fit = self.smooth_factor * self.right_fit + (1 - self.smooth_factor) * fit
-                
-            return fit
-        except:
-            return None
-
-    def generate_lane_points(self, fit, y_start, y_end):
-        """
-        Polinom katsayılarından şerit noktalarını oluşturur
-        """
-        if fit is None:
-            return []
-            
-        # Nokta sayısını görüntü yüksekliğine göre ayarla
-        num_points = int(self.image_height * 0.1)  # Her 10 pikselde bir nokta
-        y = np.linspace(y_start, y_end, num_points)
-        x = np.polyval(fit, y)
-        
-        points = np.column_stack((x, y))
-        return points.astype(np.int32)
-
-    def filter_lines(self, lines):
-        """
-        Tespit edilen çizgileri filtreler ve şerit genişliğini ayarlar
-        """
-        if lines is None:
-            return self.prev_lines
-            
-        filtered_lines = []
-        for line in lines:
-            x1, y1, x2, y2 = line[0]
-            slope = self.calculate_slope(x1, y1, x2, y2)
-            
-            if abs(slope) >= self.min_slope and abs(slope) <= self.max_slope:
-                filtered_lines.append(line)
-        
-        left_lines, right_lines = self.separate_lanes(filtered_lines)
-        
-        # Polinom uydur
-        self.left_fit = self.fit_polynomial(left_lines, 'left')
-        self.right_fit = self.fit_polynomial(right_lines, 'right')
-        
-        # Şerit genişliğini ayarla
-        y_points = np.linspace(self.image_height, 0, int(self.image_height * 0.1))
-        self.left_fit, self.right_fit = self.adjust_lane_width(self.left_fit, self.right_fit, y_points)
-        
-        # Şerit noktalarını oluştur
-        self.left_points = self.generate_lane_points(self.left_fit, self.image_height, 0)
-        self.right_points = self.generate_lane_points(self.right_fit, self.image_height, 0)
-        
-        return filtered_lines
-
-    def preprocess_image(self, image):
-        """
-        Görüntüyü ön işleme adımlarından geçirir
-        """
-        # Görüntü boyutlarını güncelle
-        height, width = image.shape[:2]
-        if width != self.image_width or height != self.image_height:
-            self.image_width = width
-            self.image_height = height
-            self.scale_parameters()
-        
-        # Görüntüyü gri tonlamaya çevir
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        
-        # Gürültüyü azalt
-        blur = cv2.GaussianBlur(gray, (5, 5), 0)
-        
-        # Kontrastı artır
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-        enhanced = clahe.apply(blur)
-        
-        # Perspektif düzeltme uygula
-        warped = self.apply_perspective_transform(enhanced)
-        
-        return warped
-
-    def detect_edges(self, image):
-        """
-        Canny kenar tespiti uygular
-        """
-        edges = cv2.Canny(image, self.low_threshold, self.high_threshold)
-        return edges
-
-    def draw_lane_lines(self, image):
-        """
-        Şeritleri görüntüye çizer
-        """
-        # Perspektif düzeltilmiş görüntüde şeritleri çiz
-        lane_image = np.zeros_like(image)
-        
-        if len(self.left_points) > 1 and len(self.right_points) > 1:
-            # Sol şeridi çiz
-            cv2.polylines(lane_image, [self.left_points], False, (255, 255, 255), 
-                         int(3 * self.scale_factor))
-            # Sağ şeridi çiz
-            cv2.polylines(lane_image, [self.right_points], False, (255, 255, 255), 
-                         int(3 * self.scale_factor))
-            
-            # Şeritler arasını doldur
-            points = np.vstack((self.left_points, self.right_points[::-1]))
-            cv2.fillPoly(lane_image, [points], (0, 255, 0))
-        
-        # Ters perspektif dönüşümü uygula
-        lane_image = self.inverse_perspective_transform(lane_image)
-        
-        # Orijinal görüntü ile birleştir
-        result = cv2.addWeighted(image, 1, lane_image, 0.3, 0)
-        
+        cv2.fillPoly(color_warp, [np.int32(pts)], (0, 255, 0))
+        newwarp = self.inverse_perspective(color_warp, M)
+        result = cv2.addWeighted(original_img, 1, newwarp, 0.4, 0)
         return result
 
-    def detect_lanes(self, image):
-        """
-        Şeritleri tespit eder
-        """
-        processed = self.preprocess_image(image)
-        edges = self.detect_edges(processed)
-        
-        lines = cv2.HoughLinesP(
-            edges,
-            self.rho,
-            self.theta,
-            self.threshold,
-            minLineLength=self.min_line_length,
-            maxLineGap=self.max_line_gap
-        )
-        
-        self.filter_lines(lines)
-        result = self.draw_lane_lines(image)
-        
-        return result 
+    def detect_lanes(self, frame):
+        warped, M = self.get_birds_eye_view(frame)
+        binary = self.apply_thresholds(warped)
+        leftx, lefty, rightx, righty = self.find_lane_pixels(binary)
+        left_fit, right_fit = self.fit_polynomial(binary, leftx, lefty, rightx, righty)
+        result = self.draw_lanes(frame, binary, left_fit, right_fit, M)
+        return result
