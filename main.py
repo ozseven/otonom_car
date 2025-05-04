@@ -10,11 +10,15 @@ import threading
 from queue import Queue
 import concurrent.futures
 
-def resize_image(image, target_width=640, target_height=480):
+def resize_image(image, target_width=1280, target_height=720):
     """
     Görüntüyü hedef boyuta yeniden boyutlandırır
     """
-    return cv2.resize(image, (target_width, target_height))
+    # Görüntüyü döndür (90 derece saat yönünün tersine)
+    rotated = cv2.rotate(image, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    # Boyutlandır
+    resized = cv2.resize(rotated, (target_width, target_height))
+    return resized
 
 def draw_info_panel(image, fps, detected_objects):
     """
