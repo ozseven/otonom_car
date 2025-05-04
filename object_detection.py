@@ -5,7 +5,8 @@ from collections import Counter
 import torch
 
 class ObjectDetector:
-    def __init__(self, model_path='yolov8n.pt'):
+    # Varsayılan modeli yolov8l.pt olarak değiştir
+    def __init__(self, model_path='yolov8l.pt'): 
         """
         YOLO modelini başlatır
         
@@ -74,4 +75,4 @@ class ObjectDetector:
                 cv2.putText(image, label, (x1, y1 - 5),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
         
-        return image, dict(detected_objects) 
+        return image, dict(detected_objects)
