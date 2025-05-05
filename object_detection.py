@@ -6,7 +6,7 @@ import torch
 
 class ObjectDetector:
     # Varsayılan modeli yolov8l.pt olarak değiştir
-    def __init__(self, model_path='yolov8l.pt'): 
+    def __init__(self, model_path='yolov8n.pt'): 
         """
         YOLO modelini başlatır
         
